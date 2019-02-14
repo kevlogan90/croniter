@@ -88,6 +88,7 @@ class croniter(object):
         self.start_time = start_time
         self.dst_start_time = start_time
         self.cur = start_time
+        self.results = []
 
         self.expanded, self.nth_weekday_of_month = self.expand(expr_format)
 
@@ -166,61 +167,66 @@ class croniter(object):
     iter = all_next  # alias, you can call .iter() instead of .all_next()
 
     def _get_next(self, ret_type=None, is_prev=False):
-        expanded = self.expanded[:]
         nth_weekday_of_month = self.nth_weekday_of_month.copy()
-
         ret_type = ret_type or self._ret_type
-
         if not issubclass(ret_type, (float, datetime.datetime)):
             raise TypeError("Invalid ret_type, only 'float' or 'datetime' "
                             "is acceptable.")
 
-        # exception to support day of month and day of week as defined in cron
-        if (expanded[2][0] != '*' and expanded[4][0] != '*') and self._day_or:
-            bak = expanded[4]
-            expanded[4] = ['*']
-            t1 = self._calc(self.cur, expanded, nth_weekday_of_month, is_prev)
-            expanded[4] = bak
-            expanded[2] = ['*']
+        if not self.results:
+            for expanded in self.expanded[:]:
+                # exception to support day of month and day of week as defined in cron
+                if (expanded[2][0] != '*' and expanded[4][0] != '*') and self._day_or:
+                    bak = expanded[4]
+                    expanded[4] = ['*']
+                    t1 = self._calc(self.cur, expanded, nth_weekday_of_month, is_prev)
+                    expanded[4] = bak
+                    bak = expanded[2]
+                    expanded[2] = ['*']
+                    t2 = self._calc(self.cur, expanded, nth_weekday_of_month, is_prev)
+                    expanded[2] = bak
+                    if is_prev:
+                        result = max([t1, t2])
+                    else:
+                        result = min([t1, t2])
+                else:
+                    result = self._calc(self.cur, expanded,
+                                        nth_weekday_of_month, is_prev)
 
-            t2 = self._calc(self.cur, expanded, nth_weekday_of_month, is_prev)
-            if not is_prev:
-                result = t1 if t1 < t2 else t2
-            else:
-                result = t1 if t1 > t2 else t2
+                # DST Handling for cron job spanning accross days
+                dtstarttime = self._timestamp_to_datetime(self.dst_start_time)
+                dtstarttime_utcoffset = (
+                    dtstarttime.utcoffset() or datetime.timedelta(0))
+                dtresult = self._timestamp_to_datetime(result)
+                lag = lag_hours = 0
+                # do we trigger DST on next crontab (handle backward changes)
+                dtresult_utcoffset = dtstarttime_utcoffset
+                if dtresult and self.tzinfo:
+                    dtresult_utcoffset = dtresult.utcoffset()
+                    lag_hours = (
+                        self._timedelta_to_seconds(dtresult - dtstarttime) / (60*60)
+                    )
+                    lag = self._timedelta_to_seconds(
+                        dtresult_utcoffset - dtstarttime_utcoffset
+                    )
+                hours_before_midnight = 24 - dtstarttime.hour
+                if dtresult_utcoffset != dtstarttime_utcoffset:
+                    if ((lag > 0 and lag_hours >= hours_before_midnight)
+                        or (lag < 0 and
+                            ((3600*lag_hours+abs(lag)) >= hours_before_midnight*3600))
+                    ):
+                        dtresult = dtresult - datetime.timedelta(seconds=lag)
+                        result = self._datetime_to_timestamp(dtresult)
+                        self.dst_start_time = result
+                if issubclass(ret_type, datetime.datetime):
+                    result = dtresult
+                self.results.append(result)
+        if is_prev:
+            result = max(self.results)
         else:
-            result = self._calc(self.cur, expanded,
-                                nth_weekday_of_month, is_prev)
-
-        # DST Handling for cron job spanning accross days
-        dtstarttime = self._timestamp_to_datetime(self.dst_start_time)
-        dtstarttime_utcoffset = (
-            dtstarttime.utcoffset() or datetime.timedelta(0))
-        dtresult = self._timestamp_to_datetime(result)
-        lag = lag_hours = 0
-        # do we trigger DST on next crontab (handle backward changes)
-        dtresult_utcoffset = dtstarttime_utcoffset
-        if dtresult and self.tzinfo:
-            dtresult_utcoffset = dtresult.utcoffset()
-            lag_hours = (
-                self._timedelta_to_seconds(dtresult - dtstarttime) / (60*60)
-            )
-            lag = self._timedelta_to_seconds(
-                dtresult_utcoffset - dtstarttime_utcoffset
-            )
-        hours_before_midnight = 24 - dtstarttime.hour
-        if dtresult_utcoffset != dtstarttime_utcoffset:
-            if ((lag > 0 and lag_hours >= hours_before_midnight)
-                or (lag < 0 and
-                    ((3600*lag_hours+abs(lag)) >= hours_before_midnight*3600))
-            ):
-                dtresult = dtresult - datetime.timedelta(seconds=lag)
-                result = self._datetime_to_timestamp(dtresult)
-                self.dst_start_time = result
-        self.cur = result
-        if issubclass(ret_type, datetime.datetime):
-            result = dtresult
-        return result
+            result = min(self.results)
+        self.cur = self._datetime_to_timestamp(result)
+        return self.results.pop(self.results.index(result))
 
     def _calc(self, now, expanded, nth_weekday_of_month, is_prev):
         if is_prev:
@@ -460,107 +466,112 @@ class croniter(object):
             return False
 
     @classmethod
-    def expand(cls, expr_format):
-        expressions = expr_format.split()
+    def expand(cls, expr_formats):
+        if not isinstance(expr_formats, list):
+            expr_formats = [expr_formats]
+        multi_expanded = []
+        for expr_format in expr_formats:
+            expressions = expr_format.split()
 
-        if len(expressions) not in VALID_LEN_EXPRESSION:
-            raise CroniterBadCronError(cls.bad_length)
+            if len(expressions) not in VALID_LEN_EXPRESSION:
+                raise CroniterBadCronError(cls.bad_length)
 
-        expanded = []
-        nth_weekday_of_month = {}
+            expanded = []
+            nth_weekday_of_month = {}
 
-        for i, expr in enumerate(expressions):
-            e_list = expr.split(',')
-            res = []
+            for i, expr in enumerate(expressions):
+                e_list = expr.split(',')
+                res = []
 
-            while len(e_list) > 0:
-                e = e_list.pop()
+                while len(e_list) > 0:
+                    e = e_list.pop()
 
-                if i == 4:
-                    e, sep, nth = str(e).partition('#')
-                    if nth and not re.match(r'[1-5]', nth):
-                        raise CroniterBadDateError(
-                            "[{0}] is not acceptable".format(expr_format))
-
-                t = re.sub(r'^\*(\/.+)$', r'%d-%d\1' % (
-                    cls.RANGES[i][0],
-                    cls.RANGES[i][1]),
-                    str(e))
-                m = search_re.search(t)
-
-                if not m:
-                    t = re.sub(r'^(.+)\/(.+)$', r'\1-%d/\2' % (
-                        cls.RANGES[i][1]),
-                        str(e))
-                    m = step_search_re.search(t)
-
-                if m:
-                    (low, high, step) = m.group(1), m.group(2), m.group(4) or 1
-
-                    if not any_int_re.search(low):
-                        low = "{0}".format(cls._alphaconv(i, low, expressions))
-
-                    if not any_int_re.search(high):
-                        high = "{0}".format(cls._alphaconv(i, high, expressions))
-
-                    if (
-                        not low or not high or int(low) > int(high)
-                        or not only_int_re.search(str(step))
-                    ):
-                        if i == 4 and high == '0':
-                            # handle -Sun notation -> 7
-                            high = '7'
-                        else:
+                    if i == 4:
+                        e, sep, nth = str(e).partition('#')
+                        if nth and not re.match(r'[1-5]', nth):
                             raise CroniterBadDateError(
                                 "[{0}] is not acceptable".format(expr_format))
 
-                    low, high, step = map(int, [low, high, step])
-                    try:
-                        rng = range(low, high + 1, step)
-                    except ValueError as exc:
-                        raise CroniterBadCronError(
-                            'invalid range: {0}'.format(exc))
-                    e_list += (["{0}#{1}".format(item, nth) for item in rng]
-                        if i == 4 and nth else rng)
-                else:
-                    if t.startswith('-'):
-                        raise CroniterBadCronError(
-                            "[{0}] is not acceptable,\
-                            negative numbers not allowed".format(
-                                        expr_format))
-                    if not star_or_int_re.search(t):
-                        t = cls._alphaconv(i, t, expressions)
+                    t = re.sub(r'^\*(\/.+)$', r'%d-%d\1' % (
+                        cls.RANGES[i][0],
+                        cls.RANGES[i][1]),
+                        str(e))
+                    m = search_re.search(t)
 
-                    try:
-                        t = int(t)
-                    except:
-                        pass
+                    if not m:
+                        t = re.sub(r'^(.+)\/(.+)$', r'\1-%d/\2' % (
+                            cls.RANGES[i][1]),
+                            str(e))
+                        m = step_search_re.search(t)
 
-                    if t in cls.LOWMAP[i]:
-                        t = cls.LOWMAP[i][t]
+                    if m:
+                        (low, high, step) = m.group(1), m.group(2), m.group(4) or 1
 
-                    if (
-                        t not in ["*", "l"]
-                        and (int(t) < cls.RANGES[i][0] or
-                             int(t) > cls.RANGES[i][1])
-                    ):
-                        raise CroniterBadCronError(
-                            "[{0}] is not acceptable, out of range".format(
-                                expr_format))
+                        if not any_int_re.search(low):
+                            low = "{0}".format(cls._alphaconv(i, low, expressions))
 
-                    res.append(t)
+                        if not any_int_re.search(high):
+                            high = "{0}".format(cls._alphaconv(i, high, expressions))
 
-                    if i == 4 and nth:
-                        if t not in nth_weekday_of_month:
-                            nth_weekday_of_month[t] = set()
-                        nth_weekday_of_month[t].add(int(nth))
+                        if (
+                            not low or not high or int(low) > int(high)
+                            or not only_int_re.search(str(step))
+                        ):
+                            if i == 4 and high == '0':
+                                # handle -Sun notation -> 7
+                                high = '7'
+                            else:
+                                raise CroniterBadDateError(
+                                    "[{0}] is not acceptable".format(expr_format))
 
-            res.sort()
-            expanded.append(['*'] if (len(res) == 1
-                                      and res[0] == '*')
-                            else res)
+                        low, high, step = map(int, [low, high, step])
+                        try:
+                            rng = range(low, high + 1, step)
+                        except ValueError as exc:
+                            raise CroniterBadCronError(
+                                'invalid range: {0}'.format(exc))
+                        e_list += (["{0}#{1}".format(item, nth) for item in rng]
+                            if i == 4 and nth else rng)
+                    else:
+                        if t.startswith('-'):
+                            raise CroniterBadCronError(
+                                "[{0}] is not acceptable,\
+                                negative numbers not allowed".format(
+                                            expr_format))
+                        if not star_or_int_re.search(t):
+                            t = cls._alphaconv(i, t, expressions)
 
-        return expanded, nth_weekday_of_month
+                        try:
+                            t = int(t)
+                        except:
+                            pass
+
+                        if t in cls.LOWMAP[i]:
+                            t = cls.LOWMAP[i][t]
+
+                        if (
+                            t not in ["*", "l"]
+                            and (int(t) < cls.RANGES[i][0] or
+                                 int(t) > cls.RANGES[i][1])
+                        ):
+                            raise CroniterBadCronError(
+                                "[{0}] is not acceptable, out of range".format(
+                                    expr_format))
+
+                        res.append(t)
+
+                        if i == 4 and nth:
+                            if t not in nth_weekday_of_month:
+                                nth_weekday_of_month[t] = set()
+                            nth_weekday_of_month[t].add(int(nth))
+
+                res.sort()
+                expanded.append(['*'] if (len(res) == 1
+                                          and res[0] == '*')
+                                else res)
+            multi_expanded.append(expanded)
+
+        return multi_expanded, nth_weekday_of_month
 
     @classmethod
     def is_valid(cls, expression):
